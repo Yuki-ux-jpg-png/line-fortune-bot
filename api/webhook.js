@@ -1,0 +1,187 @@
+import crypto from "node:crypto";
+import { createClient } from "@supabase/supabase-js";
+import { generateFortune } from "../lib/fortune.js";
+
+export default {
+  async fetch(request) {
+    if (request.method === "GET") {
+      return new Response("LINE fortune bot is running.", { status: 200 });
+    }
+
+    if (request.method !== "POST") {
+      return new Response("Method Not Allowed", {
+        status: 405,
+        headers: { Allow: "GET, POST" }
+      });
+    }
+
+    try {
+      const rawBody = await request.text();
+      const signature = request.headers.get("x-line-signature");
+
+      if (!verifyLineSignature(rawBody, signature)) {
+        console.error("Invalid LINE signature");
+        return new Response("Invalid signature", { status: 401 });
+      }
+
+      const payload = JSON.parse(rawBody);
+      const events = Array.isArray(payload.events) ? payload.events : [];
+
+      if (events.length === 0) {
+        return new Response("OK", { status: 200 });
+      }
+
+      await Promise.all(events.map(handleEvent));
+      return new Response("OK", { status: 200 });
+    } catch (error) {
+      console.error("Webhook error:", error);
+      return new Response("Internal Server Error", { status: 500 });
+    }
+  }
+};
+
+function requiredEnv(name) {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing environment variable: ${name}`);
+  return value;
+}
+
+function getSupabase() {
+  return createClient(
+    requiredEnv("SUPABASE_URL"),
+    requiredEnv("SUPABASE_SECRET_KEY"),
+    {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false
+      }
+    }
+  );
+}
+
+function verifyLineSignature(rawBody, signature) {
+  if (!signature) return false;
+
+  const expected = crypto
+    .createHmac("sha256", requiredEnv("LINE_CHANNEL_SECRET"))
+    .update(rawBody, "utf8")
+    .digest("base64");
+
+  const expectedBuffer = Buffer.from(expected);
+  const actualBuffer = Buffer.from(signature);
+
+  return (
+    expectedBuffer.length === actualBuffer.length &&
+    crypto.timingSafeEqual(expectedBuffer, actualBuffer)
+  );
+}
+
+async function handleEvent(event) {
+  const replyToken = event.replyToken;
+  const userId = event.source?.userId;
+
+  if (!replyToken || !userId || !isFortuneRequest(event)) return;
+
+  const fortuneDate = getTodayInJst();
+  const message = await getOrCreateFortune(userId, fortuneDate);
+  await replyText(replyToken, message);
+}
+
+function isFortuneRequest(event) {
+  if (event.type === "message" && event.message?.type === "text") {
+    const text = event.message.text.trim();
+    return text === "占い" || text === "今日の占い";
+  }
+
+  return (
+    event.type === "postback" &&
+    event.postback?.data === "fortune=today"
+  );
+}
+
+function getTodayInJst() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+
+  const values = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value])
+  );
+
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+async function getOrCreateFortune(userId, fortuneDate) {
+  const supabase = getSupabase();
+
+  const { data: existing, error: selectError } = await supabase
+    .from("fortunes")
+    .select("fortune_result")
+    .eq("line_user_id", userId)
+    .eq("fortune_date", fortuneDate)
+    .maybeSingle();
+
+  if (selectError) throw selectError;
+
+  if (existing) {
+    return `${existing.fortune_result}
+
+――――――――――
+※今日の占いはすでに完了しています。
+また明日、新しい運勢を占ってください🔮`;
+  }
+
+  const fortuneResult = generateFortune(fortuneDate);
+
+  const { error: insertError } = await supabase.from("fortunes").insert({
+    line_user_id: userId,
+    fortune_date: fortuneDate,
+    fortune_result: fortuneResult
+  });
+
+  if (!insertError) return fortuneResult;
+
+  if (insertError.code === "23505") {
+    const { data: saved, error: retryError } = await supabase
+      .from("fortunes")
+      .select("fortune_result")
+      .eq("line_user_id", userId)
+      .eq("fortune_date", fortuneDate)
+      .single();
+
+    if (retryError) throw retryError;
+
+    return `${saved.fortune_result}
+
+――――――――――
+※今日の占いはすでに完了しています。
+また明日、新しい運勢を占ってください🔮`;
+  }
+
+  throw insertError;
+}
+
+async function replyText(replyToken, text) {
+  const response = await fetch("https://api.line.me/v2/bot/message/reply", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${requiredEnv("LINE_CHANNEL_ACCESS_TOKEN")}`
+    },
+    body: JSON.stringify({
+      replyToken,
+      messages: [{ type: "text", text }]
+    })
+  });
+
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(`LINE Reply API error ${response.status}: ${details}`);
+  }
+}
