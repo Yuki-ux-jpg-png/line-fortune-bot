@@ -1,0 +1,12 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import entry from '../api/tw.js';
+import taiwan from '../tw/api/webhook.js';
+process.env.LINE_TW_CHANNEL_SECRET='test-tw-only';
+process.env.LINE_CHANNEL_SECRET='test-jp-different';
+globalThis.fetch=async()=>{throw new Error('External requests disabled');};
+test('root entry delegates to the existing Taiwan handler',()=>assert.equal(entry,taiwan));
+test('GET is a read-only traditional Chinese health response',async()=>{const r=await entry.fetch(new Request('https://example.test/api/tw'));assert.equal(r.status,200);assert.match(await r.text(),/台灣/);});
+test('unsigned requests are rejected before database or LINE calls',async()=>{const r=await entry.fetch(new Request('https://example.test/api/tw',{method:'POST',body:'{}'}));assert.equal(r.status,401);});
+test('Taiwan verification accepts empty events but rejects the Japanese secret',async()=>{const body=JSON.stringify({events:[]});for(const [secret,status] of [['test-tw-only',200],['test-jp-different',401]]){const signature=crypto.createHmac('sha256',secret).update(body).digest('base64');const r=await entry.fetch(new Request('https://example.test/api/tw',{method:'POST',headers:{'x-line-signature':signature},body}));assert.equal(r.status,status);}});
